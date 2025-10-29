@@ -1,120 +1,66 @@
 #!/usr/bin/env python3
 """
-AIME eval with vLLM + DeepSeek 7B
+AIME2025 (OpenCompass) eval with vLLM + DeepSeek 7B
 
-- Pulls AIME questions #0 and #13 from a Hugging Face dataset
+- Pulls questions from Hugging Face dataset: opencompass/AIME2025 (subsets: AIME2025-I & AIME2025-II), split="test"
+- Uses global 0-based indices across the concatenated order [AIME2025-I (0..14), then AIME2025-II (15..29)]
 - Loads a DeepSeek 7B-ish model with vLLM
-- Runs N attempts per question
-- Asks the model to format the final answer in GSM8K style: "#### <answer>"
+- Runs N attempts per selected question indices
+- Prompts the model to end with GSM8K-style final line: "#### <answer>"
 - Captures top log probabilities per generated token
-- Saves generations as a pandas DataFrame (to both .parquet and .csv)
+- Saves generations as pandas (Parquet + CSV)
 
-Usage (example):
+Example:
   python aime_vllm_deepseek.py \
     --model deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --attempts 7 \
     --questions 0 13 \
     --logprobs 5 \
     --out generations.parquet
-
-Notes:
-- You need a GPU setup compatible with vLLM.
-- Install requirements first: `pip install -r requirements.txt`.
-- If the first dataset path fails, the script tries a couple of sensible fallbacks.
 """
 
 import argparse
 import json
 import os
 import re
-import sys
 from typing import Dict, List, Tuple, Any
 
 import pandas as pd
 
-# Lazy imports so the script can still be opened without these packages installed.
+
 def _lazy_import_vllm():
     from vllm import LLM, SamplingParams
     return LLM, SamplingParams
 
+
 def _lazy_import_datasets():
-    from datasets import load_dataset
-    return load_dataset
+    from datasets import load_dataset, Dataset
+    return load_dataset, Dataset
 
 
-AIME_DATASET_CANDIDATES = [
-    # (dataset_name, subset, split)
-    ("hendrycks/competition_math", "aime", "test"),
-    # Some forks present all AIME problems under a split without subset. We'll try anyway.
-    ("hendrycks/competition_math", None, "test"),
-    # A more recent/alternative source sometimes used in evals
-    ("openai/ai-math-competitions", "aime", "test"),
-    ("openai/ai-math-competitions", "aime24", "test"),
-]
-
-
-def find_aime_dataset() -> Tuple[Any, str]:
-    """Try multiple HF datasets until one works; return the dataset split and a label for logging."""
-    load_dataset = _lazy_import_datasets()
-    last_err = None
-    for name, subset, split in AIME_DATASET_CANDIDATES:
-        try:
-            if subset is None:
-                ds = load_dataset(name, split=split)
-                label = f"{name}:{split}"
-            else:
-                ds = load_dataset(name, subset, split=split)
-                label = f"{name}/{subset}:{split}"
-            # basic field sanity
-            if len(ds) == 0:
-                continue
-            # Heuristic: expect a problem/question-like field
-            fields = set(ds.features.keys())
-            if not ({"problem", "solution"} & fields):
-                # Some datasets use 'question'/'answer' instead.
-                if not ({"question", "answer"} & fields):
-                    continue
-            return ds, label
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(
-        "Could not locate an AIME dataset from known candidates. "
-        f"Last error: {last_err}"
-    )
+def load_aime2025_concat() -> Tuple[Any, str]:
+    """Load opencompass/AIME2025 both subsets and concatenate to a single list-like split."""
+    load_dataset, Dataset = _lazy_import_datasets()
+    ds_i = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
+    ds_ii = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
+    # Both have fields: question (str), answer (str). Concatenate preserving order I then II.
+    ds_all = Dataset.from_list(list(ds_i) + list(ds_ii))
+    return ds_all, "opencompass/AIME2025:[AIME2025-I,test]+[AIME2025-II,test]"
 
 
 def extract_qa_fields(example: Dict[str, Any]) -> Tuple[str, str]:
-    """Normalize to (question_text, ground_truth_answer_str)."""
-    # Try common field names
-    if "problem" in example:
-        q = example["problem"]
-    elif "question" in example:
-        q = example["question"]
-    else:
-        # Fallback: stringify everything
-        q = json.dumps(example, ensure_ascii=False)
-
-    if "solution" in example:
-        a = example["solution"]
-    elif "answer" in example:
-        a = example["answer"]
-    else:
-        a = ""
-
-    # Some solutions are multi-line; keep as-is.
+    q = example.get("question", "")
+    a = example.get("answer", "")
     return str(q), str(a)
 
 
 def build_prompt(question_text: str) -> str:
-    """Instruct the model to show reasoning but end with GSM8K-style final answer line."""
     system = (
         "You are a careful competition math solver. "
         "Solve the problem step by step. "
         "At the very end, output the final numeric answer on a new line as: #### <answer>"
     )
     user = question_text.strip()
-    # Simple chat-style prompt for chat/instruct models; for base models this still works reasonably.
     prompt = (
         f"<|system|>\n{system}\n</|system|>\n"
         f"<|user|>\n{user}\n</|user|>\n"
@@ -124,35 +70,20 @@ def build_prompt(question_text: str) -> str:
 
 
 def parse_gsm8k_final(text: str) -> str:
-    """
-    Extract the GSM8K-style final answer: line starting with '#### '.
-    Returns the extracted answer (string after '#### ') or '' if none.
-    """
     m = re.search(r"^####\s*(.+)$", text.strip(), flags=re.MULTILINE)
     return m.group(1).strip() if m else ""
 
 
 def flatten_logprobs(token_logprobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Convert vLLM logprobs structure into a simple per-token list of:
-      {
-        "token": <generated token>,
-        "logprob": <model logprob for this token>,
-        "top_logprobs": [{"token": t, "logprob": lp}, ...]  # top-k alternatives
-      }
-    """
     flat = []
-    for entry in token_logprobs:
-        # 'entry' is a vLLM TokenLogprobs object or dict-like; handle both
+    for entry in token_logprobs or []:
         tok = getattr(entry, "decoded_token", None) or entry.get("decoded_token", "")
         lp = getattr(entry, "logprob", None) if hasattr(entry, "logprob") else entry.get("logprob", None)
         top = getattr(entry, "top_logprobs", None) if hasattr(entry, "top_logprobs") else entry.get("top_logprobs", None)
 
         top_list = []
         if top:
-            # Each top item can be (token, logprob) objects
             for alt in top:
-                # alt could be tuple-like or object/dict-like
                 atok = getattr(alt, "decoded_token", None) or alt.get("decoded_token", "")
                 alp = getattr(alt, "logprob", None) if hasattr(alt, "logprob") else alt.get("logprob", None)
                 top_list.append({"token": atok, "logprob": float(alp) if alp is not None else None})
@@ -176,37 +107,33 @@ def run(
     out_path: str,
     dtype: str = "bfloat16",
 ):
-    # 1) Load dataset
-    ds, ds_label = find_aime_dataset()
-    print(f"[INFO] Using dataset: {ds_label} (size={len(ds)})", flush=True)
+    ds_all, ds_label = load_aime2025_concat()
+    print(f"[INFO] Loaded {ds_label} (size={len(ds_all)})", flush=True)
 
-    # Grab the selected questions (by index) – if an index is out of range, we mod-wrap.
-    indices = [q % len(ds) for q in questions]
-    rows = [ds[i] for i in indices]
+    # Wrap indices modulo the dataset length.
+    N = len(ds_all)
+    indices = [q % N for q in questions]
+    rows = [ds_all[i] for i in indices]
 
-    question_blobs = []
+    blob = []
     for idx_source, ex in zip(indices, rows):
         q_text, gt = extract_qa_fields(ex)
-        question_blobs.append({
+        blob.append({
             "dataset_label": ds_label,
             "dataset_index": idx_source,
             "question_text": q_text,
             "ground_truth": gt,
         })
 
-    # 2) Build prompts
-    prompt_pack = []
-    for qb in question_blobs:
-        prompt_pack.append((qb, build_prompt(qb["question_text"])))
+    prompts = [(b, build_prompt(b["question_text"])) for b in blob]
 
-    # 3) Init vLLM
+    # Init vLLM
     print(f"[INFO] Loading model via vLLM: {model_name}", flush=True)
     LLM, SamplingParams = _lazy_import_vllm()
     llm = LLM(
         model=model_name,
         trust_remote_code=True,
         dtype=dtype,
-        # tensor_parallel_size can be set via env var VLLM_TEST_TP_SIZE or CLI; we leave default (1).
     )
 
     sampling = SamplingParams(
@@ -215,24 +142,24 @@ def run(
         max_tokens=max_new_tokens,
         n=1,
         logprobs=logprobs_k,
-        stop=None,
     )
 
-    # 4) Generate attempts
     records = []
-    for qb, prompt in prompt_pack:
+    for qb, prompt in prompts:
         for attempt in range(attempts):
             outputs = llm.generate([prompt], sampling)
             out = outputs[0].outputs[0]
 
             text = out.text
-            final_answer = parse_gsm8k_final(text)
 
-            # Collect token-level logprobs (list with per-token info)
+            raw_final = extract_boxed_text(text)
+            norm_final = normalize_number(raw_final) if raw_final else None
+            final_answer = norm_final if norm_final is not None else (raw_final or "")
+
             tlogs = out.logprobs or []
             flat_logs = flatten_logprobs(tlogs)
 
-            record = {
+            records.append({
                 "dataset": qb["dataset_label"],
                 "dataset_index": qb["dataset_index"],
                 "question": qb["question_text"],
@@ -244,32 +171,29 @@ def run(
                 "final_answer": final_answer,
                 "final_answer_gsm8k": f"#### {final_answer}" if final_answer else "",
                 "token_logprobs": flat_logs,
-            }
-            records.append(record)
+            })
             print(f"[ATTEMPT] idx={qb['dataset_index']} attempt={attempt} final=({final_answer})", flush=True)
 
-    # 5) Save as pandas
     df = pd.DataFrame.from_records(records)
-    # Save in both parquet and csv (parquet preferred for nested columns)
     root, ext = os.path.splitext(out_path)
     parquet_path = out_path if ext.lower() == ".parquet" else root + ".parquet"
     csv_path = root + ".csv"
 
     df.to_parquet(parquet_path, index=False)
-    # For CSV, we will json-encode the nested column
-    df_for_csv = df.copy()
-    df_for_csv["token_logprobs"] = df_for_csv["token_logprobs"].apply(json.dumps)
-    df_for_csv.to_csv(csv_path, index=False)
+    df_csv = df.copy()
+    df_csv["token_logprobs"] = df_csv["token_logprobs"].apply(json.dumps)
+    df_csv.to_csv(csv_path, index=False)
 
     print(f"[DONE] Wrote {len(df)} rows to: {parquet_path} and {csv_path}", flush=True)
 
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
                         help="DeepSeek 7B-8B model to load with vLLM.")
     parser.add_argument("--questions", type=int, nargs="+", default=[0, 13],
-                        help="Question indices to pull from the AIME dataset (will wrap with modulo if out of range).")
+                        help="Global 0-based indices across AIME2025-I then AIME2025-II.")
     parser.add_argument("--attempts", type=int, default=7, help="Attempts per question.")
     parser.add_argument("--logprobs", type=int, default=5, help="Top-K logprobs to record per token.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Max generated tokens.")
